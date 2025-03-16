@@ -114,9 +114,18 @@ def plot_attention_weights(avg_attention):
 
 # 特征归因可视化
 # 特征归因可视化
+# 特征归因可视化
 def visualize_attributions(model, dataset, tokenizer, device='cuda', num_samples=5):
-    # 加载IntegratedGradients
-    ig = IntegratedGradients(model)
+    # 创建一个包装模型类来处理特征归因
+    class ModelWrapper(torch.nn.Module):
+        def __init__(self, model, image, attention_mask):
+            super(ModelWrapper, self).__init__()
+            self.model = model
+            self.image = image
+            self.attention_mask = attention_mask
+            
+        def forward(self, input_ids):
+            return self.model(self.image, input_ids, self.attention_mask)[0]
     
     # 随机选择样本
     indices = np.random.choice(len(dataset), size=num_samples, replace=False)
@@ -140,53 +149,68 @@ def visualize_attributions(model, dataset, tokenizer, device='cuda', num_samples
         predicted = predicted.item()
         pred_rating = rating_pred.item()
         
+        # 创建包装模型
+        wrapped_model = ModelWrapper(model, image, attention_mask)
+        
+        # 创建IntegratedGradients实例
+        ig = IntegratedGradients(wrapped_model)
+        
         # 计算文本的归因度
-        attributions_text = ig.attribute(
-            input_ids,
-            target=predicted,
-            n_steps=50,
-            internal_batch_size=1,
-            method='gausslegendre'
-        )
-        
-        # 处理归因结果
-        attributions_sum = attributions_text.sum(dim=2).squeeze(0)
-        attributions_norm = attributions_sum / torch.norm(attributions_sum)
-        attributions_np = attributions_norm.cpu().detach().numpy()
-        
-        # 获取词汇
-        tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
-        
-        # 过滤掉特殊令牌
-        valid_indices = [i for i, token in enumerate(tokens) if token not in ['[PAD]', '[CLS]', '[SEP]']]
-        valid_tokens = [tokens[i] for i in valid_indices]
-        valid_attributions = [attributions_np[i] for i in valid_indices]
-        
-        # 创建图形
-        plt.figure(figsize=(10, 8))
-        
-        # 特征归因条形图
-        plt.subplot(2, 1, 1)
-        plt.barh(range(len(valid_tokens[-30:])), valid_attributions[-30:])
-        plt.yticks(range(len(valid_tokens[-30:])), valid_tokens[-30:])
-        plt.title(f'Feature Attribution for Text (Sample {idx}, Pred: {predicted}, True: {sentiment})')
-        plt.xlabel('Attribution Score')
-        
-        # 生成词云
-        plt.subplot(2, 1, 2)
-        # 将归因值映射到颜色和大小
-        scores = {t: max(0, a) for t, a in zip(valid_tokens, valid_attributions)}
-        wordcloud_plus = WordCloud(width=800, height=400, 
-                                   background_color='white',
-                                   stopwords=set(stopwords.words('english')),
-                                   max_words=100).generate_from_frequencies(scores)
-        plt.imshow(wordcloud_plus, interpolation='bilinear')
-        plt.axis('off')
-        plt.title('Word Cloud with Positive Attributions')
-        
-        plt.tight_layout()
-        plt.savefig(f'results/attribution_sample_{idx}.png')
-        plt.close()
+        try:
+            attributions_text = ig.attribute(
+                input_ids,
+                target=predicted,
+                n_steps=20,  # 减少步骤以加快计算
+                internal_batch_size=1,
+                method='gausslegendre'
+            )
+            
+            # 处理归因结果
+            attributions_sum = attributions_text.sum(dim=2).squeeze(0)
+            attributions_norm = attributions_sum / torch.norm(attributions_sum)
+            attributions_np = attributions_norm.cpu().detach().numpy()
+            
+            # 获取词汇
+            tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
+            
+            # 过滤掉特殊令牌
+            valid_indices = [i for i, token in enumerate(tokens) if token not in ['[PAD]', '[CLS]', '[SEP]']]
+            valid_tokens = [tokens[i] for i in valid_indices]
+            valid_attributions = [attributions_np[i] for i in valid_indices]
+            
+            # 创建图形
+            plt.figure(figsize=(10, 8))
+            
+            # 特征归因条形图
+            plt.subplot(2, 1, 1)
+            last_n = min(30, len(valid_tokens))
+            plt.barh(range(last_n), valid_attributions[-last_n:])
+            plt.yticks(range(last_n), valid_tokens[-last_n:])
+            plt.title(f'Feature Attribution for Text (Sample {idx}, Pred: {predicted}, True: {sentiment})')
+            plt.xlabel('Attribution Score')
+            
+            # 生成词云
+            plt.subplot(2, 1, 2)
+            # 将归因值映射到颜色和大小
+            scores = {t: max(0, a) for t, a in zip(valid_tokens, valid_attributions)}
+            # 确保scores不为空
+            if not scores:
+                scores = {"no_attributions": 1.0}
+            wordcloud_plus = WordCloud(width=800, height=400, 
+                                       background_color='white',
+                                       stopwords=set(stopwords.words('english')),
+                                       max_words=100).generate_from_frequencies(scores)
+            plt.imshow(wordcloud_plus, interpolation='bilinear')
+            plt.axis('off')
+            plt.title('Word Cloud with Positive Attributions')
+            
+            plt.tight_layout()
+            plt.savefig(f'results/attribution_sample_{idx}.png')
+            plt.close()
+            
+        except Exception as e:
+            print(f"Error computing attributions for sample {idx}: {e}")
+            continue
 
 # 可视化不同模态的模型性能
 def compare_modalities(test_loader, device='cuda'):
@@ -198,6 +222,8 @@ def compare_modalities(test_loader, device='cuda'):
     # 创建仅图像模型
     image_model = MultiModalSentimentModel(num_classes=2)
     image_model.load_state_dict(torch.load('models/best_multimodal_model.pth', map_location=device))
+    image_model = image_model.to(device)  # 确保模型在正确的设备上
+    
     # 让文本特征变为0
     def forward_image_only(self, image, input_ids, attention_mask):
         # 正常处理图像
@@ -205,13 +231,13 @@ def compare_modalities(test_loader, device='cuda'):
         
         # 文本特征设为0
         batch_size = img_features.shape[0]
-        text_features = torch.zeros(batch_size, 512).to(image.device)
+        text_features = torch.zeros(batch_size, 512, device=image.device)  # 明确指定设备
         
         # 特征拼接
         combined_features = torch.cat([img_features, text_features], dim=1)
         
         # 固定注意力权重
-        attention_weights = torch.tensor([[1.0, 0.0]]).repeat(batch_size, 1).to(image.device)
+        attention_weights = torch.tensor([[1.0, 0.0]], device=image.device).repeat(batch_size, 1)  # 明确指定设备
         
         # 加权融合
         img_attended = img_features * attention_weights[:, 0].unsqueeze(1)
@@ -230,14 +256,16 @@ def compare_modalities(test_loader, device='cuda'):
     # 替换前向传播方法
     image_model.forward = forward_image_only.__get__(image_model)
     
-    # 创建仅文本模型
+    # 创建仅文本模型 - 同样的修改
     text_model = MultiModalSentimentModel(num_classes=2)
     text_model.load_state_dict(torch.load('models/best_multimodal_model.pth', map_location=device))
+    text_model = text_model.to(device)  # 确保模型在正确的设备上
+    
     # 让图像特征变为0
     def forward_text_only(self, image, input_ids, attention_mask):
         # 图像特征设为0
         batch_size = input_ids.shape[0]
-        img_features = torch.zeros(batch_size, 512).to(image.device)
+        img_features = torch.zeros(batch_size, 512, device=image.device)  # 明确指定设备
         
         # 正常处理文本
         text_output = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask)
@@ -247,7 +275,7 @@ def compare_modalities(test_loader, device='cuda'):
         combined_features = torch.cat([img_features, text_features], dim=1)
         
         # 固定注意力权重
-        attention_weights = torch.tensor([[0.0, 1.0]]).repeat(batch_size, 1).to(image.device)
+        attention_weights = torch.tensor([[0.0, 1.0]], device=image.device).repeat(batch_size, 1)  # 明确指定设备
         
         # 加权融合
         img_attended = img_features * attention_weights[:, 0].unsqueeze(1)
